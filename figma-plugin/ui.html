@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>MCP Bridge</title>
+</head>
+<body>
+  <div id="status">Connecting...</div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const socket = new WebSocket('ws://localhost:8765');
+
+    socket.onopen = () => {
+      statusEl.textContent = 'Connected to bridge';
+      socket.send(JSON.stringify({ role: 'plugin' }));
+    };
+
+    socket.onmessage = (event) => {
+      console.log('UI received from bridge:', event.data);
+      const command = JSON.parse(event.data);
+      parent.postMessage({ pluginMessage: command }, '*');
+    };
+
+    // NEW: results coming back from code.js get forwarded to the bridge
+    window.onmessage = (event) => {
+      const result = event.data.pluginMessage;
+      if (result && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(result));
+        console.log('UI sent result to bridge:', result);
+      }
+    };
+
+    socket.onerror = (err) => {
+      statusEl.textContent = 'Connection error';
+      console.error('WebSocket error:', err);
+    };
+
+    socket.onclose = () => {
+      statusEl.textContent = 'Disconnected from bridge';
+    };
+  </script>
+</body>
+</html>

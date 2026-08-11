@@ -1,0 +1,267 @@
+figma.showUI(__html__, { width: 300, height: 100 });
+
+// ---- Shared helpers ----------------------------------------------------
+
+function resolveParent(parent_id) {
+  if (parent_id) {
+    const node = figma.getNodeById(parent_id);
+    if (node) return node;
+  }
+  return figma.currentPage;
+}
+
+function applyFill(node, color) {
+  if (color) {
+    node.fills = [{ type: "SOLID", color: { r: color.r, g: color.g, b: color.b } }];
+  }
+}
+
+function applyEffects(node, effects) {
+  if (!effects || effects.length === 0) return;
+  node.effects = effects.map((e) => ({
+    type: e.type,
+    color: e.color ? { r: e.color.r, g: e.color.g, b: e.color.b, a: e.opacity ?? 0.25 } : { r: 0, g: 0, b: 0, a: e.opacity ?? 0.25 },
+    offset: { x: e.offset_x ?? 0, y: e.offset_y ?? 2 },
+    radius: e.radius ?? 4,
+    visible: true,
+    blendMode: "NORMAL",
+  }));
+}
+
+function applyConstraints(node, constraints) {
+  if (!constraints) return;
+  if ("constraints" in node) {
+    node.constraints = { horizontal: constraints.horizontal, vertical: constraints.vertical };
+  }
+}
+
+function applyAutoLayout(frameNode, autoLayout) {
+  if (!autoLayout) return;
+  frameNode.layoutMode = autoLayout.direction;
+  frameNode.itemSpacing = autoLayout.spacing ?? 8;
+  frameNode.paddingLeft = frameNode.paddingRight = autoLayout.padding ?? 16;
+  frameNode.paddingTop = frameNode.paddingBottom = autoLayout.padding ?? 16;
+  const alignMap = { MIN: "MIN", CENTER: "CENTER", MAX: "MAX", SPACE_BETWEEN: "SPACE_BETWEEN" };
+  frameNode.primaryAxisAlignItems = alignMap[autoLayout.align_items] || "MIN";
+}
+
+async function loadDefaultFont() {
+  await figma.loadFontAsync({ family: "Inter", style: "Regular" });
+}
+
+// ---- Command handlers ---------------------------------------------------
+
+const commandHandlers = {
+  ping_plugin: () => ({ status: "ok", message: "pong" }),
+
+  create_frame: (payload) => {
+    const { x, y, width, height, name, color, auto_layout, constraints, effects, parent_id } = payload;
+    const frame = figma.createFrame();
+    frame.x = x; frame.y = y;
+    frame.resize(width, height);
+    frame.name = name || "Frame";
+    applyFill(frame, color);
+    applyAutoLayout(frame, auto_layout);
+    applyEffects(frame, effects);
+    resolveParent(parent_id).appendChild(frame);
+    applyConstraints(frame, constraints);
+    return { status: "ok", node_id: frame.id };
+  },
+
+  create_component: (payload) => {
+    const { x, y, width, height, name, color, auto_layout, constraints, effects, parent_id } = payload;
+    const comp = figma.createComponent();
+    comp.x = x; comp.y = y;
+    comp.resize(width, height);
+    comp.name = name || "Component";
+    applyFill(comp, color);
+    applyAutoLayout(comp, auto_layout);
+    applyEffects(comp, effects);
+    resolveParent(parent_id).appendChild(comp);
+    applyConstraints(comp, constraints);
+    return { status: "ok", node_id: comp.id };
+  },
+
+  create_component_set: (payload) => {
+    const { child_node_ids, name, x, y } = payload;
+    const nodes = child_node_ids.map((id) => figma.getNodeById(id)).filter(Boolean);
+    if (nodes.length === 0) {
+      return { status: "error", message: "No valid child nodes to combine into variants" };
+    }
+    const set = figma.combineAsVariants(nodes, figma.currentPage);
+    set.name = name || "Component Set";
+    if (typeof x === "number") set.x = x;
+    if (typeof y === "number") set.y = y;
+    return { status: "ok", node_id: set.id };
+  },
+
+  create_group: (payload) => {
+    const { child_node_ids, name } = payload;
+    const nodes = child_node_ids.map((id) => figma.getNodeById(id)).filter(Boolean);
+    if (nodes.length === 0) {
+      return { status: "error", message: "No valid child nodes to group" };
+    }
+    const group = figma.group(nodes, figma.currentPage);
+    group.name = name || "Group";
+    return { status: "ok", node_id: group.id };
+  },
+
+  create_rectangle: (payload) => {
+    const { x, y, width, height, color, corner_radius, constraints, effects, parent_id } = payload;
+    const rect = figma.createRectangle();
+    rect.x = x; rect.y = y;
+    rect.resize(width, height);
+    rect.cornerRadius = corner_radius || 0;
+    applyFill(rect, color);
+    applyEffects(rect, effects);
+    resolveParent(parent_id).appendChild(rect);
+    applyConstraints(rect, constraints);
+    return { status: "ok", node_id: rect.id };
+  },
+
+  create_ellipse: (payload) => {
+    const { x, y, width, height, color, effects, constraints, parent_id } = payload;
+    const ellipse = figma.createEllipse();
+    ellipse.x = x; ellipse.y = y;
+    ellipse.resize(width, height);
+    applyFill(ellipse, color);
+    applyEffects(ellipse, effects);
+    resolveParent(parent_id).appendChild(ellipse);
+    applyConstraints(ellipse, constraints);
+    return { status: "ok", node_id: ellipse.id };
+  },
+
+  create_line: (payload) => {
+    const { x, y, width, color, parent_id } = payload;
+    const line = figma.createLine();
+    line.x = x; line.y = y;
+    line.resize(width || 100, 0);
+    if (color) {
+      line.strokes = [{ type: "SOLID", color: { r: color.r, g: color.g, b: color.b } }];
+    }
+    line.strokeWeight = 1;
+    resolveParent(parent_id).appendChild(line);
+    return { status: "ok", node_id: line.id };
+  },
+
+  create_text: async (payload) => {
+    const { x, y, content, font_size, color, parent_id } = payload;
+    await loadDefaultFont();
+    const text = figma.createText();
+    text.x = x; text.y = y;
+    text.fontSize = font_size || 16;
+    text.characters = content || "";
+    applyFill(text, color || { r: 0, g: 0, b: 0 });
+    resolveParent(parent_id).appendChild(text);
+    return { status: "ok", node_id: text.id };
+  },
+
+  // Composite: gray box + caption. No plugin-level "image" concept exists
+  // without real asset upload, so this is an explicit placeholder.
+  create_image_placeholder: async (payload) => {
+    const { x, y, width, height, content, parent_id } = payload;
+    const parent = resolveParent(parent_id);
+
+    const box = figma.createRectangle();
+    box.x = x; box.y = y;
+    box.resize(width, height);
+    box.fills = [{ type: "SOLID", color: { r: 0.85, g: 0.85, b: 0.85 } }];
+    parent.appendChild(box);
+
+    await loadDefaultFont();
+    const label = figma.createText();
+    label.fontSize = 12;
+    label.characters = content || "Image";
+    label.fills = [{ type: "SOLID", color: { r: 0.5, g: 0.5, b: 0.5 } }];
+    label.x = x + Math.max(0, width / 2 - 20);
+    label.y = y + height / 2 - 8;
+    parent.appendChild(label);
+
+    return { status: "ok", node_id: box.id };
+  },
+
+  // Best-effort icon placeholder: a small circle + 1-2 char label.
+  // Real icon-set/SVG import is a documented future extension, not
+  // implemented here (Figma has no built-in icon primitive).
+  create_icon: async (payload) => {
+    const { x, y, width, height, content, color, parent_id } = payload;
+    const parent = resolveParent(parent_id);
+    const size = Math.min(width || 24, height || 24);
+
+    const circle = figma.createEllipse();
+    circle.x = x; circle.y = y;
+    circle.resize(size, size);
+    applyFill(circle, color || { r: 0.9, g: 0.9, b: 0.9 });
+    parent.appendChild(circle);
+
+    if (content) {
+      await loadDefaultFont();
+      const label = figma.createText();
+      label.fontSize = Math.max(8, Math.floor(size / 2));
+      label.characters = content.slice(0, 2);
+      label.x = x + size / 4;
+      label.y = y + size / 4;
+      parent.appendChild(label);
+    }
+
+    return { status: "ok", node_id: circle.id };
+  },
+
+  apply_color_style: (payload) => {
+    const { name, color } = payload;
+    const style = figma.createPaintStyle();
+    style.name = name;
+    style.paints = [{ type: "SOLID", color: { r: color.r, g: color.g, b: color.b } }];
+    return { status: "ok", style_id: style.id };
+  },
+
+  apply_text_style: async (payload) => {
+    const { name, font_size, font_weight } = payload;
+    const weight = font_weight || "Regular";
+    await figma.loadFontAsync({ family: "Inter", style: weight });
+    const style = figma.createTextStyle();
+    style.name = name;
+    style.fontSize = font_size || 16;
+    style.fontName = { family: "Inter", style: weight };
+    return { status: "ok", style_id: style.id };
+  },
+
+  // Best-effort: requires the Figma Variables API (may be unavailable
+  // depending on plan/editor type). Wrapped safely by the outer try/catch.
+  create_variable: (payload) => {
+    const { name, collection, var_type, value } = payload;
+    let coll = figma.variables.getLocalVariableCollections().find((c) => c.name === collection);
+    if (!coll) {
+      coll = figma.variables.createVariableCollection(collection);
+    }
+    const variable = figma.variables.createVariable(name, coll, var_type);
+    const modeId = coll.modes[0].modeId;
+    if (var_type === "COLOR" && value) {
+      variable.setValueForMode(modeId, { r: value.r, g: value.g, b: value.b, a: 1 });
+    } else {
+      variable.setValueForMode(modeId, value);
+    }
+    return { status: "ok", variable_id: variable.id };
+  },
+};
+
+// ---- Dispatch loop --------------------------------------------------------
+
+figma.ui.onmessage = async (command) => {
+  console.log("code.js received command:", command);
+  const { request_id, action, payload } = command;
+  const handler = commandHandlers[action];
+
+  let result;
+  if (!handler) {
+    result = { status: "error", message: `Unknown action: ${action}` };
+  } else {
+    try {
+      result = await handler(payload || {});
+    } catch (err) {
+      result = { status: "error", message: String(err) };
+    }
+  }
+
+  figma.ui.postMessage({ request_id, ...result });
+};
