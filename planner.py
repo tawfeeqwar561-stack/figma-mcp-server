@@ -15,7 +15,7 @@ from design_plan import DesignPlan
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are a UI design planner. Given a natural-language description of a screen, output a single JSON object using EXACTLY this shape. Do not add extra fields. Do not nest groups. Keep elements as a FLAT list, all as children of one root frame.
+_SYSTEM_PROMPT = """You are a UI design planner. Given a natural-language description of a screen, output a single JSON object using EXACTLY this shape. Do not add extra fields. Do not nest a rectangle inside another rectangle's children with more than depth 2. Keep elements as a FLAT list of frame -> (text | rectangle) children only, one level deep.
 
 {
   "screen_name": "string",
@@ -37,12 +37,13 @@ _SYSTEM_PROMPT = """You are a UI design planner. Given a natural-language descri
   ]
 }
 
-Rules:
+CRITICAL RULES:
+- color_styles, text_styles, and variables MUST always be empty arrays: []. Never put anything inside them.
 - Color values are floats between 0.0 and 1.0, never 0-255.
 - Only use "type": "frame", "text", or "rectangle". Nothing else.
+- A "rectangle" or "text" element's "children" MUST always be an empty list [].
+- Only a "frame" element may have non-empty "children".
 - Every element must have ALL fields shown above, in that order, no extras.
-- children can be an empty list [] for text and rectangle elements.
-- Do not use "group" or "component_set" types.
 - Output ONLY the JSON object. No explanation, no markdown."""
 
 
@@ -71,7 +72,6 @@ def _basic_json_repairs(text: str) -> str:
 
 
 def _fix_duplicate_color_keys(text: str) -> str:
-    """Fix a common small-model mistake: {"r":.., "g":.., "g":..} instead of "r","g","b"."""
     def fix_color_obj(match: "re.Match") -> str:
         inner = match.group(1)
         pairs = re.findall(r'"(\w)"\s*:\s*([\d.]+)', inner)
@@ -86,22 +86,81 @@ def _fix_duplicate_color_keys(text: str) -> str:
     return re.sub(r'\{("[rgb]"\s*:\s*[\d.]+(?:\s*,\s*"[rgb]"\s*:\s*[\d.]+)*)\}', fix_color_obj, text)
 
 
+def _strip_invalid_token_arrays(text: str) -> str:
+    """
+    The small model sometimes fills color_styles/text_styles/variables with
+    malformed entries even though the prompt says to leave them empty.
+    Since these are optional/advanced fields, force them to empty arrays
+    in the parsed dict before validation rather than fighting the model's
+    output structure.
+    """
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    if isinstance(obj, dict):
+        for key in ("color_styles", "text_styles", "variables"):
+            if key in obj and not isinstance(obj[key], list):
+                obj[key] = []
+            elif key in obj:
+                obj[key] = []  # force empty regardless of content — model rarely gets this right
+    return json.dumps(obj)
+
+
+def _flatten_deep_children(text: str) -> str:
+    """
+    The small model sometimes nests text/rectangle elements inside another
+    text/rectangle's children (only frames should have non-empty children).
+    Recursively hoist any grandchildren of a non-frame element up to be
+    siblings instead, rather than failing validation outright.
+    """
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+    def fix_node(node):
+        if not isinstance(node, dict):
+            return node
+        children = node.get("children", [])
+        if node.get("type") != "frame" and children:
+            # Non-frame node has children it shouldn't — drop them.
+            node["children"] = []
+        else:
+            node["children"] = [fix_node(c) for c in children]
+        return node
+
+    if isinstance(obj, dict) and "elements" in obj:
+        obj["elements"] = [fix_node(e) for e in obj["elements"]]
+    return json.dumps(obj)
+
+
 def parse_plan_json(raw_text: str) -> DesignPlan:
-    attempts = [
+    base_attempts = [
         raw_text,
         _strip_code_fences(raw_text),
         _extract_json_object(_strip_code_fences(raw_text)),
         _basic_json_repairs(_extract_json_object(_strip_code_fences(raw_text))),
         _fix_duplicate_color_keys(_basic_json_repairs(_extract_json_object(_strip_code_fences(raw_text)))),
     ]
+
+    # For each base attempt, also try the structural repairs (strip bad
+    # token arrays, flatten illegally-nested children) as a final pass.
+    all_attempts = list(base_attempts)
+    for attempt in base_attempts:
+        repaired = _strip_invalid_token_arrays(attempt)
+        repaired = _flatten_deep_children(repaired)
+        all_attempts.append(repaired)
+
     last_error = None
-    for attempt_text in attempts:
+    for attempt_text in all_attempts:
         try:
             parsed = json.loads(attempt_text)
             return DesignPlan(**parsed)
         except (json.JSONDecodeError, ValidationError) as exc:
             last_error = exc
             continue
+
     logger.error("All JSON repair attempts failed. Raw output: %s", raw_text[:800])
     raise ValueError(f"Could not parse LLM output into a valid DesignPlan: {last_error}")
 

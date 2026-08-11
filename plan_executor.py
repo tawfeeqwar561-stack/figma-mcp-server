@@ -1,4 +1,4 @@
-"""
+﻿"""
 Plan Executor.
 Walks a DesignPlan tree and executes it against the Figma plugin via
 bridge_client, resolving parent/child relationships, groups, and
@@ -42,7 +42,11 @@ async def execute_plan(plan: DesignPlan) -> dict[str, Any]:
 async def execute_node(node: DesignNode, parent_id: str | None) -> dict[str, Any]:
     """
     Execute one node (and recursively, its children), returning its result.
-    Result dict includes '_children' with nested results for inspection.
+    Only container-capable types (frame, component) can actually hold
+    children in Figma â€” if a non-container node has children (a model
+    mistake), they are hoisted up to be siblings under this node's OWN
+    parent instead of being attached to this node, which would crash
+    the plugin (RectangleNode/TextNode have no appendChild).
     """
     if node.type in _POST_HOC_CONTAINERS:
         return await _execute_post_hoc_container(node, parent_id)
@@ -53,14 +57,18 @@ async def execute_node(node: DesignNode, parent_id: str | None) -> dict[str, Any
     result = await bridge_client.send_figma_command(action, payload)
     node_id = result.get("node_id")
 
+    _CONTAINER_TYPES = {"frame", "component"}
     child_results = []
     if node.children and result.get("status") == "ok" and node_id:
+        # Only frame/component can hold real children in Figma's API.
+        # For anything else (rectangle, text, etc.), attach children to
+        # THIS node's parent instead, to avoid an invalid appendChild call.
+        effective_parent = node_id if node.type in _CONTAINER_TYPES else parent_id
         for child in node.children:
-            child_results.append(await execute_node(child, parent_id=node_id))
+            child_results.append(await execute_node(child, parent_id=effective_parent))
 
     result["_children"] = child_results
     return result
-
 
 async def _execute_post_hoc_container(node: DesignNode, parent_id: str | None) -> dict[str, Any]:
     """
