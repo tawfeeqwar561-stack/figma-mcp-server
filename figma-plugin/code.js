@@ -1,4 +1,4 @@
-figma.showUI(__html__, { width: 300, height: 100 });
+﻿figma.showUI(__html__, { width: 300, height: 100 });
 
 // ---- Shared helpers ----------------------------------------------------
 
