@@ -23,7 +23,7 @@ from design_plan import DesignPlan, DesignNode, ColorRGB
 
 logger = logging.getLogger(__name__)
 
-_MAX_RETRIES = 3
+_MAX_RETRIES = 2
 
 # ---------------------------------------------------------------------------
 # Simplified schema the LLM actually fills in
@@ -49,15 +49,17 @@ Output EXACTLY this shape, nothing else:
   ]
 }
 
-Element type meanings:
-- "heading": a large title at the top of the screen.
-- "text": a small label or line of information.
-- "input": a labeled field the user types into (e.g. email, password, search). Use the field's label as content, e.g. "Email".
-- "button": a tappable action. Use the button's label as content, e.g. "Submit".
+Element type meanings and how to map common UI concepts to them:
+- "heading": a large title. Use for: page titles, welcome messages, section titles.
+- "text": a line of information or description. Use for: "balance card" -> a text line showing an amount like "Balance: $2,450.00". "spending insights" -> a text summary line. "recent transactions" -> 2-3 separate text elements, one per transaction, e.g. "Coffee Shop -$4.50". Any descriptive or informational content becomes "text".
+- "input": a labeled field the user types into. Use for: email, password, search, name, amount fields.
+- "button": a tappable action. Use for: "quick actions" -> one button per action mentioned (or 2-3 generic ones like "Send", "Request" if unspecified). "bottom navigation" -> 2-4 buttons, one per nav item (e.g. "Home", "Cards", "Settings").
 
 RULES:
-- Every "content" value must be specific to the user's request. Never leave it blank, never write "string" or "text" or "label".
-- Include one element per distinct thing the user mentioned.
+- Every "content" value must be specific and realistic (invent plausible real values like amounts, names, dates where the request implies data, e.g. transactions or balances).
+- Never leave content blank, never write "string" or "text" or "label".
+- Cap the total number of elements at 10, even if the request could imply more — pick the most important ones.
+- Ignore purely stylistic/tone instructions (e.g. "modern", "premium", "clean typography", "light theme") — they do not map to elements, just skip them.
 - Do not include x, y, width, height, or color — only type and content.
 - Output ONLY the JSON object. No explanation, no markdown."""
 
@@ -139,12 +141,19 @@ def build_design_plan(simple: SimplePlan) -> DesignPlan:
             y += 36 + 24
 
         elif el.type == "text":
+            # Multi-line content (model sometimes crams several lines into
+            # one element, e.g. a transaction list) needs a taller box and
+            # a bigger y-increment, or it visually overlaps the next
+            # element even though the JSON coordinates look fine.
+            line_count = max(1, el.content.count("\n") + 1)
+            line_height = 22
+            text_height = line_count * line_height
             children.append(DesignNode(
                 type="text", name="text_line", x=_MARGIN, y=y,
-                width=_CONTENT_WIDTH, height=22, content=el.content,
+                width=_CONTENT_WIDTH, height=text_height, content=el.content,
                 font_size=15, color=ColorRGB(r=0.25, g=0.25, b=0.25),
             ))
-            y += 22 + 16
+            y += text_height + 16
 
         elif el.type == "input":
             children.append(DesignNode(
@@ -196,7 +205,7 @@ class Planner(ABC):
 
 
 class OllamaPlanner(Planner):
-    def __init__(self, base_url: str, model: str, timeout: float = 90.0) -> None:
+    def __init__(self, base_url: str, model: str, timeout: float = 45.0) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout
@@ -214,7 +223,7 @@ class OllamaPlanner(Planner):
             "format": "json",
             "stream": False,
             "keep_alive": "10m",
-            "options": {"temperature": 0.4, "num_predict": 500},
+            "options": {"temperature": 0.4, "num_predict": 700},
         }
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(f"{self._base_url}/api/chat", json=body)
@@ -333,3 +342,5 @@ def get_planner() -> Planner:
         model=config.OLLAMA_MODEL,
     )
     return FallbackPlanner(primary=ollama, fallback=TemplatePlanner())
+
+

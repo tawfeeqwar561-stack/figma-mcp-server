@@ -150,6 +150,29 @@ Watch the Figma canvas — a real frame with real nodes will appear within rough
 - **Generic placeholder content when the user doesn't specify exact values.** If a prompt says "a checkout screen with a total price," the model may generate its own reasonable placeholder value (e.g. "$99.99") rather than leaving it blank — expected behavior for a mockup generator, not a bug, but worth knowing before a live demo with very open-ended prompts.
 - **`OllamaPlanner` includes a retry loop (up to 3 attempts) and a semantic quality gate** that rejects output with placeholder-leakage (e.g. the model echoing literal instruction text like `"string"`) before it reaches the canvas. This meaningfully improved reliability across untested, varied prompts during development (music player, checkout, onboarding, settings screens all verified working end-to-end). It is not a formal guarantee for arbitrary prompts — highly unusual or very complex requests may still occasionally exhaust retries and fall back to `TemplatePlanner`. `AnthropicPlanner` (verified working, just needs API credits) would substantially improve reliability further for arbitrary natural language.
 
+## Roadmap to production (NeGD / organizational deployment)
+
+This is a validated working prototype, not yet a deployable service. Here's the honest gap, and what's already been closed today.
+
+**Already addressed:**
+- **Data sovereignty**: the LLM (`OllamaPlanner`) runs entirely locally — no prompt, design content, or Figma data is ever sent to a third-party API. This is usually the hardest compliance requirement for an AI tool in a government context, and this architecture satisfies it by design.
+- **Audit trail**: every `generate_ui_from_prompt` call is now logged to `audit_log.jsonl` (timestamp, prompt, screen name, success/failure, node counts) via `audit_log.py`. Minimal but real — a production deployment would extend this to a centralized log store with real user identity attached.
+
+**Required before any internal pilot (even 1–2 users):**
+- **Real authentication.** Currently a single shared Figma token in `.env`. Needs per-user Figma OAuth so each person's actions use their own account and permissions.
+- **A real deployment**, not three manually-started terminals on one laptop — the bridge needs to run as an always-on service (containerized, auto-restarting) that a team can actually rely on.
+- **User-facing error messages.** Failures currently surface as raw Python tracebacks in a terminal; a pilot needs clean, actionable error messages instead.
+
+**Required before multi-user rollout:**
+- **Multi-connection bridge.** The current bridge tracks one plugin connection at a time; concurrent users would cross-talk or silently fail. Needs per-user session routing.
+- **Per-user Figma file isolation.** Currently one shared `FIGMA_FILE_ID`; each user's generations need to go to their own file/session.
+- **Automated test suite.** Everything verified so far was manual, interactive testing during development — a real deployment needs repeatable, automated regression tests.
+
+**Valuable but not blocking:**
+- Broader design capability: multi-screen generation with navigation, real image/icon assets, custom color theming per request, richer component/variant support.
+
+None of the above requires redesigning the architecture — the MCP → Bridge → Plugin pipeline, the Planner abstraction, and the deterministic layout engine all stay as-is. This is additive engineering work with a clear scope, not an open-ended unknown.
+
 ## What this demonstrates
 
 This project validates the full architecture required for AI-driven Figma automation: an AI assistant can describe a UI in natural language and have it materialize as real, editable Figma nodes — not a static image, not a mockup, but actual frames/text/rectangles a designer can continue working with. The remaining path to a complete design-automation platform (more node-composite types, true auto-layout-driven positioning, a richer component/variant system, multi-screen flows) is additive work on top of a working, extensible foundation — not a redesign.

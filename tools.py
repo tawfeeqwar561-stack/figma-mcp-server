@@ -1,4 +1,4 @@
-"""
+﻿"""
 MCP tool definitions for Figma operations.
 Each function here is registered as a tool in server.py.
 """
@@ -73,8 +73,10 @@ async def execute_design_plan(plan: DesignPlan) -> dict:
 
 async def generate_from_prompt(prompt: str) -> dict:
     """Convert a natural-language prompt into a plan, then execute it."""
+    import audit_log
     planner = get_planner()
     plan = await planner.generate_plan(prompt)
     result = await execute_plan(plan)
     result["generated_plan"] = plan.model_dump()
+    audit_log.log_generation(prompt, result)
     return result
