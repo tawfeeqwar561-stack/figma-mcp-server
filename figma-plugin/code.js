@@ -212,18 +212,23 @@ create_frame: (payload) => {
     return { status: "ok", node_id: line.id };
   },
 
-  create_text: async (payload) => {
-    const { x, y, content, font_size, color, parent_id } = payload;
+ create_text: async (payload) => {
+    const { x, y, width, content, font_size, color, parent_id, name } = payload;
     await loadDefaultFont();
     const text = figma.createText();
     text.x = x; text.y = y;
     text.fontSize = font_size || 16;
     text.characters = content || "";
     applyFill(text, color || { r: 0, g: 0, b: 0 });
+
+    if (name !== "button_label" && width) {
+      text.textAutoResize = "HEIGHT";
+      text.resize(width, text.height);
+    }
+
     resolveParent(parent_id).appendChild(text);
     return { status: "ok", node_id: text.id };
   },
-
   // Composite: gray box + caption. No plugin-level "image" concept exists
   // without real asset upload, so this is an explicit placeholder.
   create_image_placeholder: async (payload) => {
