@@ -11,6 +11,8 @@ from typing import Any
 
 import websockets
 
+import config
+
 logger = logging.getLogger(__name__)
 
 BRIDGE_URI = "ws://localhost:8765"
@@ -27,7 +29,8 @@ async def send_figma_command(action: str, payload: dict[str, Any]) -> dict[str, 
 
     try:
         async with websockets.connect(BRIDGE_URI) as websocket:
-            await websocket.send(json.dumps({"role": "controller"}))
+            token = config.get_or_create_bridge_token()
+            await websocket.send(json.dumps({"role": "controller", "token": token}))
             await websocket.send(json.dumps(message))
             logger.info("Sent command: %s", message)
 

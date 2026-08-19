@@ -4,3 +4,4 @@ __pycache__/
 .env
 .vscode/
 audit_log.jsonl
+.bridge_token

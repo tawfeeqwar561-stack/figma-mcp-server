@@ -9,35 +9,51 @@
 
   <script>
     const statusEl = document.getElementById('status');
-    const socket = new WebSocket('ws://localhost:8765');
+    let socket;
 
-    socket.onopen = () => {
-      statusEl.textContent = 'Connected to bridge';
-      socket.send(JSON.stringify({ role: 'plugin' }));
-    };
+    async function connect() {
+      let token = '';
+      try {
+        const tokenResponse = await fetch('http://localhost:8765/token');
+        const tokenData = await tokenResponse.json();
+        token = tokenData.token || '';
+      } catch (err) {
+        statusEl.textContent = 'Failed to fetch bridge token';
+        console.error('Could not fetch bridge token:', err);
+      }
 
-    socket.onmessage = (event) => {
-      console.log('UI received from bridge:', event.data);
-      const command = JSON.parse(event.data);
-      parent.postMessage({ pluginMessage: command }, '*');
-    };
+      socket = new WebSocket('ws://localhost:8765');
 
-    // NEW: results coming back from code.js get forwarded to the bridge
+      socket.onopen = () => {
+        statusEl.textContent = 'Connected to bridge';
+        socket.send(JSON.stringify({ role: 'plugin', token }));
+      };
+
+      socket.onmessage = (event) => {
+        console.log('UI received from bridge:', event.data);
+        const command = JSON.parse(event.data);
+        parent.postMessage({ pluginMessage: command }, '*');
+      };
+
+      socket.onerror = (err) => {
+        statusEl.textContent = 'Connection error';
+        console.error('WebSocket error:', err);
+      };
+
+      socket.onclose = () => {
+        statusEl.textContent = 'Disconnected from bridge';
+      };
+    }
+
+    connect();
+
+    // Results coming back from code.js get forwarded to the bridge.
     window.onmessage = (event) => {
       const result = event.data.pluginMessage;
-      if (result && socket.readyState === WebSocket.OPEN) {
+      if (result && socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify(result));
         console.log('UI sent result to bridge:', result);
       }
-    };
-
-    socket.onerror = (err) => {
-      statusEl.textContent = 'Connection error';
-      console.error('WebSocket error:', err);
-    };
-
-    socket.onclose = () => {
-      statusEl.textContent = 'Disconnected from bridge';
     };
   </script>
 </body>

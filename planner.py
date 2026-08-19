@@ -91,13 +91,17 @@ def _strong_shadow(palette):
 
 class SimpleElement(BaseModel):
     type: Literal["heading", "text", "input", "button"]
-    content: str
+    # Tighter than DesignNode.content since this is pre-layout-expansion
+    # raw model output -- see H-6 in bridge-security-hardening.
+    content: str = Field(max_length=500)
 
 
 class SimplePlan(BaseModel):
     screen_name: str
     theme: str = _DEFAULT_THEME
-    elements: list[SimpleElement] = Field(min_length=1)
+    # Turns the "cap at 10 elements" prompt instruction into a real,
+    # enforced ceiling -- see H-6 in bridge-security-hardening.
+    elements: list[SimpleElement] = Field(min_length=1, max_length=10)
 
 
 _THEME_NAMES = ", ".join(f'"{k}"' for k in _THEMES)

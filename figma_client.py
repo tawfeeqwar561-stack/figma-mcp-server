@@ -33,6 +33,7 @@ def get_file(file_id: str | None = None) -> dict[str, Any]:
     Raises:
         httpx.HTTPStatusError: If Figma returns a non-2xx response.
     """
+    config.validate_config()
     file_id = file_id or config.FIGMA_FILE_ID
     url = f"{FIGMA_API_BASE}/files/{file_id}"
 

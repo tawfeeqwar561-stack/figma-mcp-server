@@ -8,6 +8,7 @@ import logging
 
 from mcp.server.fastmcp import FastMCP
 
+import config
 import tools
 from design_plan import DesignPlan
 
@@ -103,5 +104,6 @@ async def generate_ui_from_prompt(prompt: str) -> dict:
 
 
 if __name__ == "__main__":
+    config.validate_config()
     logger.info("Starting Figma MCP Server...")
     mcp.run()

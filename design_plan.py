@@ -58,7 +58,7 @@ class DesignNode(BaseModel):
     width: int = 100
     height: int = 40
 
-    content: str = ""            # text / icon label / placeholder caption
+    content: str = Field(default="", max_length=2000)  # text / icon label / placeholder caption
     font_size: int = 16
     corner_radius: int = 0
     color: ColorRGB | None = None
@@ -69,7 +69,9 @@ class DesignNode(BaseModel):
     effects: list[EffectConfig] = Field(default_factory=list)
 
     variant_properties: dict[str, str] = Field(default_factory=dict)
-    children: list["DesignNode"] = Field(default_factory=list)
+    # Cap enforced at construction time (not just a prompt instruction) to
+    # bound plan size/time -- see H-6 in bridge-security-hardening.
+    children: list["DesignNode"] = Field(default_factory=list, max_length=50)
 
 
 DesignNode.model_rebuild()  # required for the recursive self-reference
@@ -100,4 +102,5 @@ class DesignPlan(BaseModel):
     color_styles: list[ColorStyleDef] = Field(default_factory=list)
     text_styles: list[TextStyleDef] = Field(default_factory=list)
     variables: list[VariableDef] = Field(default_factory=list)
-    elements: list[DesignNode]
+    # Cap enforced at construction time -- see H-6 in bridge-security-hardening.
+    elements: list[DesignNode] = Field(max_length=20)
