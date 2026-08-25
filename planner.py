@@ -20,8 +20,10 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
+import components
 import config
-from design_plan import DesignPlan, DesignNode, ColorRGB, EffectConfig
+from design_plan import AutoLayoutConfig, DesignPlan, DesignNode, ColorRGB, EffectConfig
+from design_tokens import DEFAULT_STYLE, STYLE_NAMES, get_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +89,45 @@ def _strong_shadow(palette):
 
 # ---------------------------------------------------------------------------
 # Simplified schema the LLM actually fills in
+#
+# NOTE ON BACKWARD COMPATIBILITY: this schema is intentionally shared by
+# BOTH the legacy flat engine (build_design_plan, still used byte-for-byte
+# by TemplatePlanner/_login_template/_dashboard_template -- several tests
+# hardcode their exact node counts) and the new semantic engine
+# (build_semantic_plan, used by OllamaPlanner/AnthropicPlanner). Every new
+# field below has a safe default and every new "type" value is additive,
+# so the legacy engine's own construction calls (which only ever use
+# "heading"/"text"/"input"/"button" with just `content` set) are completely
+# unaffected by this expansion.
 # ---------------------------------------------------------------------------
 
 class SimpleElement(BaseModel):
-    type: Literal["heading", "text", "input", "button"]
+    type: Literal[
+        "heading", "text", "paragraph", "label", "button", "input", "form",
+        "card", "stat_card", "header", "nav", "sidebar", "list", "table",
+        "badge", "avatar", "tabs", "divider", "image", "icon", "section",
+    ]
+    # Relaxed from a bare required field to default="" so semantic types
+    # that carry their meaning in `items`/`rows` instead (table, divider,
+    # nav, sidebar, tabs, badge, list) don't need a placeholder value here.
     # Tighter than DesignNode.content since this is pre-layout-expansion
     # raw model output -- see H-6 in bridge-security-hardening.
-    content: str = Field(max_length=500)
+    content: str = Field(default="", max_length=500)
+    # Additive: repeated labels -- nav/sidebar links, tabs, badges, list
+    # item titles, button-group labels, or a table's header row. Capped to
+    # keep prompt-level intent complexity (not final node count, which is
+    # still bounded by DesignNode/DesignPlan caps) bounded per H-6.
+    items: list[str] = Field(default_factory=list, max_length=12)
+    # Additive: table body rows only (each inner list is one row's cells).
+    rows: list[list[str]] = Field(default_factory=list, max_length=8)
+    # Additive: secondary text -- a stat_card's trend line, an input's
+    # placeholder, a card's body copy, a form's submit button label.
+    subtitle: str = Field(default="", max_length=500)
+    # Additive: heading size. Ignored by every other type.
+    level: Literal["display", "h1", "h2", "h3"] = "h1"
+    # Additive: free-text hint (button variant / badge tone). Unknown
+    # values fall back safely to a sensible default in components.py.
+    variant: str = ""
 
 
 class SimplePlan(BaseModel):
@@ -104,37 +138,58 @@ class SimplePlan(BaseModel):
     elements: list[SimpleElement] = Field(min_length=1, max_length=10)
 
 
-_THEME_NAMES = ", ".join(f'"{k}"' for k in _THEMES)
+_THEME_NAMES = ", ".join(f'"{k}"' for k in STYLE_NAMES)
 
-_SYSTEM_PROMPT = f"""You are a UI content planner. Read the user's screen request and output a JSON object listing the screen name, a theme, and the elements it needs, in top-to-bottom order.
+_SYSTEM_PROMPT = f"""You are a senior UI/UX designer. Read the user's screen request and output a JSON object listing the screen name, a visual style, and the elements it needs, in top-to-bottom order.
 
 Output EXACTLY this shape, nothing else:
 {{
   "screen_name": "<short title for this screen, specific to the request>",
   "theme": "<one of: {_THEME_NAMES}>",
   "elements": [
-    {{"type": "heading" | "text" | "input" | "button", "content": "<real, specific text for this element>"}}
+    {{"type": "<see element types below>", "content": "<primary text, if this type needs it>", "items": ["<repeated label>", "..."], "rows": [["<cell>", "..."]], "subtitle": "<secondary text, if needed>", "level": "h1", "variant": ""}}
   ]
 }}
+Omit any of content/items/rows/subtitle/level/variant an element does not need -- they all default to empty.
 
-Theme selection guide:
-- "professional_blue": default, use for business, finance, productivity, general apps.
-- "midnight_premium": use for premium, luxury, dark-mode-requested, or "sleek/modern" requests.
-- "calm_wellness": use for health, wellness, meditation, fitness, therapy-related requests.
-- "warm_friendly": use for social, community, food, casual, or friendly-toned requests.
+Style selection guide:
+- "professional_blue": default, business/finance/productivity/general apps.
+- "midnight_premium": premium, luxury, dark-mode, "sleek/modern" requests.
+- "calm_wellness": health, wellness, meditation, fitness, therapy.
+- "warm_friendly": social, community, food, casual, friendly-toned.
+- "minimal_saas": "minimal SaaS dashboard" or clean/minimal B2B software requests.
+- "dark_fintech": "dark fintech dashboard", trading, crypto, banking-at-night requests.
+- "modern_ecommerce": "modern ecommerce", shopping, retail, marketplace requests.
+- "healthcare_mobile": "healthcare mobile app", medical, clinical, patient-facing requests.
 
-Element type meanings and how to map common UI concepts to them:
-- "heading": a large title. Use for: page titles, welcome messages, section titles.
-- "text": a line of information or description. Use for: "balance card" -> a text line showing an amount like "Balance: $2,450.00". "spending insights" -> a text summary line. "recent transactions" -> 2-3 separate text elements, one per transaction, e.g. "Coffee Shop -$4.50". Any descriptive or informational content becomes "text".
-- "input": a labeled field the user types into. Use for: email, password, search, name, amount fields.
-- "button": a tappable action. Use for: "quick actions" -> one button per action mentioned (or 2-3 generic ones like "Send", "Request" if unspecified). "bottom navigation" -> 2-4 buttons, one per nav item (e.g. "Home", "Cards", "Settings").
+Element types:
+- "heading": a large title (set "level" to "display"/"h1"/"h2"/"h3"). Page titles, welcome messages, section titles.
+- "text" or "paragraph": a line or short block of body copy/description.
+- "label": a small standalone caption-style line.
+- "button": one tappable action in "content" (e.g. "Log In"). For several buttons in a row (e.g. "quick actions", "Send"/"Request"), put ALL labels in "items" instead and leave "content" empty.
+- "input": one labeled field the user types into. "content" = the label (e.g. "Email"), "subtitle" = placeholder text if any.
+- "form": several input fields plus a submit button. "items" = one label per field (e.g. ["Email","Password"]), "subtitle" = the submit button's label (e.g. "Log In").
+- "card": a bordered content block. "content" = its title, "subtitle" = its body copy.
+- "stat_card": one KPI number. "content" = the metric label (e.g. "Revenue"), "subtitle" = the value (e.g. "$12,400"), "items" = [a one-item trend like "+4.2%"] if relevant.
+- "header": the page's top bar. "content" = the app/page name, "items" = nav link labels (e.g. ["Dashboard","Reports","Settings"]).
+- "nav": same as "header" -- use whichever reads more naturally.
+- "sidebar": a vertical nav menu. "items" = one label per menu entry.
+- "list": a vertical list of rows. "items" = one line of text per row (e.g. recent transactions, notifications).
+- "table": tabular data. "items" = column headers, "rows" = each data row as an array of cell strings matching the header count. Keep it small (3-6 rows) unless the request implies more.
+- "badge": one or more small status/tag pills. "content" = a single badge's text, OR "items" = several badge texts. "variant" = "success"|"warning"|"error"|"primary"|"neutral".
+- "avatar": a user avatar. "content" = initials (1-2 letters).
+- "tabs": a tab strip. "items" = one label per tab.
+- "divider": a plain horizontal rule. No content needed.
+- "image": a placeholder image block. "content" = its caption (e.g. "Product photo").
+- "icon": a small icon glyph. "content" = 1-2 characters representing it.
+- "section": a titled group wrapping a short description. "content" = section title, "subtitle" = a one-line description.
 
 RULES:
-- Every "content" value must be specific and realistic (invent plausible real values like amounts, names, dates where the request implies data). NEVER output an empty string for content.
-- Never leave content blank, never write "string" or "text" or "label".
-- Cap the total number of elements at 10, even if the request could imply more.
-- Ignore purely stylistic/tone instructions beyond picking the theme (e.g. "clean typography") — they do not map to elements.
-- Do not include x, y, width, height, or color — only type, content, and theme.
+- Every text value you DO provide (content/items/subtitle) must be specific and realistic (invent plausible real values like amounts, names, dates where the request implies data).
+- Never write the literal words "string", "text", or "label" as a value.
+- Cap the total number of elements at 10, even if the request could imply more -- prefer one "table"/"list"/"nav" element with several "items"/"rows" over many separate elements.
+- Ignore purely stylistic/tone instructions beyond picking the style (e.g. "clean typography") — they do not map to elements.
+- Do not include x, y, width, height, or color — only the fields shown above.
 - Output ONLY the JSON object. No explanation, no markdown."""
 
 
@@ -177,14 +232,25 @@ def _parse_simple_plan(raw_text):
 
 
 _PLACEHOLDER_MARKERS = {"string", "text", "label", ""}
+# Types allowed to have an empty `content` because their real meaning
+# lives in `items`/`rows` instead (see SimpleElement docstring above).
+_CONTENT_OPTIONAL_TYPES = {"divider", "table", "sidebar", "tabs", "list", "nav", "header", "form", "badge"}
 
 
 def _check_semantic_quality(plan):
     if plan.screen_name.strip().lower() in _PLACEHOLDER_MARKERS:
         raise ValueError(f"Placeholder leakage in screen_name: {plan.screen_name!r}")
     for el in plan.elements:
-        if el.content.strip().lower() in _PLACEHOLDER_MARKERS:
+        content_marker = el.content.strip().lower()
+        if content_marker in _PLACEHOLDER_MARKERS and el.type not in _CONTENT_OPTIONAL_TYPES:
             raise ValueError(f"Placeholder leakage in element content: {el.content!r}")
+        for item in el.items:
+            if item.strip().lower() in _PLACEHOLDER_MARKERS:
+                raise ValueError(f"Placeholder leakage in element items: {item!r}")
+        for row in el.rows:
+            for cell in row:
+                if cell.strip().lower() in _PLACEHOLDER_MARKERS:
+                    raise ValueError(f"Placeholder leakage in table row cell: {cell!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +348,210 @@ def build_design_plan(simple):
     )
     return DesignPlan(screen_name=simple.screen_name, elements=[frame])
 
+
+# ---------------------------------------------------------------------------
+# Semantic layout engine v2 -- understands UI intent (cards, nav, forms,
+# lists, tables, headers, sidebars, etc), builds through Auto Layout via
+# components.py, and draws every color/size/weight from one DesignTokens
+# instance per screen (design_tokens.py) instead of ad hoc per-node values.
+#
+# Additive: build_design_plan (above) is completely untouched and still
+# used byte-for-byte by TemplatePlanner/_login_template/_dashboard_template/
+# _generic_fallback_template -- several existing tests hardcode their exact
+# node counts (8 for login, 6 for dashboard), so that path must never
+# change. Only OllamaPlanner/AnthropicPlanner call this new engine.
+# ---------------------------------------------------------------------------
+
+_MOBILE_KEYWORDS = ("mobile", "iphone", "ios", "android", "smartphone")
+_DESKTOP_KEYWORDS = ("desktop", "web app", "webapp", "browser", "web application")
+_DESKTOP_HINT_KEYWORDS = ("dashboard", "admin panel", "admin", "analytics", "back office", "backoffice")
+_CONTINUITY_KEYWORDS = (
+    "same design", "same style", "same system", "same theme", "matching design",
+    "matching style", "matching system", "consistent design", "consistent style",
+    "consistent with", "same design system", "like the previous", "match the previous",
+    "matching screen", "same look", "same visual", "same visual system",
+    # Broader, single-word signal covering natural phrasing like "a
+    # matching login screen" or "matching profile page" that the
+    # multi-word phrases above don't literally contain.
+    "matching",
+)
+
+
+def detect_platform(prompt: str) -> str:
+    """
+    Deterministic keyword classifier for screen size -- NOT decided by the
+    LLM, so it can never hallucinate an inconsistent size, and screens are
+    no longer hardcoded to one mobile width (see components.PLATFORM_SIZES).
+    Falls back to "desktop" for dashboard/admin-flavored requests and
+    "mobile" otherwise (matching the single-purpose auth/profile/settings
+    screens this project has historically generated at 375x812).
+    """
+    p = prompt.lower()
+    if any(re.search(rf"\b{re.escape(kw)}\b", p) for kw in _MOBILE_KEYWORDS):
+        return "mobile"
+    if any(re.search(rf"\b{re.escape(kw)}\b", p) for kw in _DESKTOP_KEYWORDS):
+        return "desktop"
+    if any(kw in p for kw in _DESKTOP_HINT_KEYWORDS):
+        return "desktop"
+    return "mobile"
+
+
+def wants_matching_style(prompt: str) -> bool:
+    """
+    Deterministic keyword detector for Phase 10 (multi-prompt agent
+    behavior): "now create a matching login screen", "using the same
+    design system", etc. Deterministic rather than LLM-decided so
+    continuity can never silently fail to apply.
+    """
+    p = prompt.lower()
+    return any(kw in p for kw in _CONTINUITY_KEYWORDS)
+
+
+# Process-wide memory of the last DesignTokens actually used, so a follow-up
+# prompt requesting "the same design system" reuses it exactly. As simple
+# as the rest of this project's existing single-shared-state model (one
+# shared bridge token, one shared Figma file, documented in README's "Known
+# limitations") -- a real multi-user/multi-conversation deployment would
+# key this by session/user instead of a bare module global.
+_last_design_tokens = None
+
+
+def _remember_tokens(tokens) -> None:
+    global _last_design_tokens
+    _last_design_tokens = tokens
+
+
+def _resolve_tokens(style_name: str, prompt: str):
+    if wants_matching_style(prompt) and _last_design_tokens is not None:
+        logger.info("Reusing previous design system (%s) for style continuity.", _last_design_tokens.name)
+        return _last_design_tokens
+    return get_tokens(style_name)
+
+
+def build_semantic_plan(simple: SimplePlan, prompt: str = "") -> DesignPlan:
+    """
+    Turn a SimplePlan (LLM content + intent) into a fully-composed,
+    Auto-Layout DesignPlan tree using components.py, with one coherent
+    DesignTokens instance driving every color/size/weight on the screen.
+    """
+    tokens = _resolve_tokens(simple.theme, prompt)
+    platform = detect_platform(prompt)
+    width, _height = components.PLATFORM_SIZES.get(platform, components.PLATFORM_SIZES["desktop"])
+
+    has_sidebar = platform == "desktop" and any(el.type == "sidebar" for el in simple.elements)
+    inner_width = max(240, width - (2 * tokens.spacing.xl) - (tokens.component_sizes.sidebar_width if has_sidebar else 0))
+
+    header_node: DesignNode | None = None
+    sidebar_node: DesignNode | None = None
+    content: list[DesignNode] = []
+    stat_buffer: list[DesignNode] = []
+
+    def _flush_stat_buffer() -> None:
+        if not stat_buffer:
+            return
+        if len(stat_buffer) == 1:
+            content.append(stat_buffer[0])
+        else:
+            content.append(DesignNode(
+                type="frame", name="stat_row", width=inner_width, height=120,
+                auto_layout=AutoLayoutConfig(
+                    direction="HORIZONTAL", spacing=tokens.spacing.md, padding=0,
+                    primary_axis_sizing="FIXED", counter_axis_sizing="AUTO",
+                ),
+                children=list(stat_buffer), semantic="stat_row",
+            ))
+        stat_buffer.clear()
+
+    for el in simple.elements:
+        if el.type in ("header", "nav"):
+            if header_node is None:
+                nav_items = (el.items or None) if platform == "desktop" else None
+                header_node = components.top_nav(tokens, el.content or simple.screen_name, nav_items=nav_items, width=width)
+            continue
+
+        if el.type == "sidebar":
+            if platform == "desktop":
+                if sidebar_node is None:
+                    sidebar_node = components.sidebar(tokens, el.items or ["Home"])
+            else:
+                # No persistent-sidebar pattern on mobile -- render as a
+                # plain nav list in the content column instead of
+                # silently dropping the user's intent.
+                _flush_stat_buffer()
+                content.append(components.list_block(
+                    tokens, [{"title": t} for t in (el.items or ["Home"])],
+                    width=inner_width, name="mobile_nav_list",
+                ))
+            continue
+
+        if el.type != "stat_card":
+            _flush_stat_buffer()
+
+        node: DesignNode | None = None
+        if el.type == "heading":
+            node = components.heading(tokens, el.content or simple.screen_name, level=el.level, width=inner_width)
+        elif el.type in ("text", "paragraph"):
+            node = components.paragraph(tokens, el.content or simple.screen_name, width=inner_width)
+        elif el.type == "label":
+            node = components.label_text(tokens, el.content or "Label")
+        elif el.type == "button":
+            if el.items:
+                node = components.button_group(tokens, el.items, variant=(el.variant or "primary"))
+            else:
+                node = components.button(tokens, el.content or "Continue", variant=(el.variant or "primary"))
+        elif el.type == "input":
+            node = components.input_field(tokens, label=el.content or None, placeholder=el.subtitle, width=inner_width)
+        elif el.type == "form":
+            fields = [(field_label, "") for field_label in (el.items or [el.content or "Field"])]
+            node = components.form(tokens, fields, submit_label=el.subtitle or "Submit", width=inner_width)
+        elif el.type == "card":
+            card_children = []
+            if el.content:
+                card_children.append(components.heading(tokens, el.content, level="h3"))
+            if el.subtitle:
+                card_children.append(components.paragraph(tokens, el.subtitle, width=inner_width - (2 * tokens.component_sizes.card_padding)))
+            node = components.card(tokens, card_children or [components.paragraph(tokens, "", width=inner_width)], width=inner_width)
+        elif el.type == "stat_card":
+            stat_node = components.stat_card(tokens, el.content or "Metric", el.subtitle or "--", delta=(el.items[0] if el.items else None))
+            stat_buffer.append(stat_node)
+        elif el.type == "list":
+            items = [{"title": t} for t in (el.items or [el.content or "Item"])]
+            node = components.list_block(tokens, items, width=inner_width)
+        elif el.type == "table":
+            node = components.table(tokens, el.items or ["Column 1"], el.rows, width=inner_width)
+        elif el.type == "badge":
+            tone = el.variant if el.variant in ("success", "warning", "error", "primary", "neutral") else "neutral"
+            if el.items:
+                node = components.badge_row(tokens, el.items, tone=tone)
+            else:
+                node = components.badge(tokens, el.content or "Status", tone=tone)
+        elif el.type == "avatar":
+            node = components.avatar(tokens, initials=el.content or "?")
+        elif el.type == "tabs":
+            node = components.tabs(tokens, el.items or [el.content or "Tab"])
+        elif el.type == "divider":
+            node = components.divider(tokens)
+        elif el.type == "image":
+            node = components.image_block(tokens, caption=el.content or "Image", width=inner_width)
+        elif el.type == "icon":
+            node = components.icon_glyph(tokens, glyph=el.content)
+        elif el.type == "section":
+            sec_children = [components.paragraph(tokens, el.subtitle, width=inner_width)] if el.subtitle else []
+            node = components.section(tokens, el.content or None, sec_children, width=inner_width)
+
+        if node is not None:
+            content.append(node)
+
+    _flush_stat_buffer()
+
+    root = components.page(
+        tokens, simple.screen_name, platform=platform,
+        header=header_node, sidebar_node=sidebar_node, content=content,
+    )
+    _remember_tokens(tokens)
+    return DesignPlan(screen_name=simple.screen_name, elements=[root], design_system=tokens.name)
+
+
 # ---------------------------------------------------------------------------
 # Planner interface + backends
 # ---------------------------------------------------------------------------
@@ -331,7 +601,7 @@ class OllamaPlanner(Planner):
                 simple = await self._call_once(prompt, nudge=(attempt > 1))
                 if attempt > 1:
                     logger.info("OllamaPlanner succeeded on retry attempt %d", attempt)
-                return build_design_plan(simple)
+                return build_semantic_plan(simple, prompt=prompt)
             except Exception as exc:
                 last_error = exc
                 logger.warning("OllamaPlanner attempt %d/%d failed: %s", attempt, _MAX_RETRIES, exc)
@@ -372,7 +642,7 @@ class AnthropicPlanner(Planner):
         raw_text = "".join(block.get("text", "") for block in data.get("content", []))
         simple = _parse_simple_plan(raw_text)
         _check_semantic_quality(simple)
-        return build_design_plan(simple)
+        return build_semantic_plan(simple, prompt=prompt)
 
 
 class TemplatePlanner(Planner):

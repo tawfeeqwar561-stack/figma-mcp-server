@@ -74,6 +74,22 @@ async def _handle_plugin(websocket: ServerConnection) -> None:
         logger.info("Plugin disconnected: %s", websocket.remote_address)
     finally:
         _plugins.discard(websocket)
+        if not _plugins:
+            # Graceful plugin disconnect handling: if that was the LAST
+            # connected plugin, any request currently in _pending_requests
+            # will now never receive a response -- fail them immediately
+            # instead of letting each one sit until bridge_client's own
+            # response timeout (or, failing that, the TTL sweep) discovers
+            # it independently. This mirrors the existing "no plugin
+            # connected" immediate error _handle_controller already gives
+            # a brand new request, extended to requests already in flight.
+            #
+            # Deliberately does NOT fire when other plugins remain
+            # connected: with multiple plugins relayed to (see
+            # _relay_to_plugins broadcasting to all of them), a pending
+            # request may still be legitimately answered by one of the
+            # others, so it would be wrong to fail it here.
+            await _fail_all_pending("The Figma plugin disconnected from the bridge.")
 
 
 async def _handle_controller(websocket: ServerConnection) -> None:
@@ -110,7 +126,18 @@ async def _handle_controller(websocket: ServerConnection) -> None:
             if request_id:
                 _pending_requests[request_id] = (websocket, time.monotonic())
             logger.info("Command from controller: %s", raw_message)
-            await _relay_to_plugins(raw_message)
+            relayed = await _relay_to_plugins(raw_message)
+            if not relayed:
+                # No plugin is connected at all -- tell the controller right
+                # away instead of making it discover this only after its own
+                # response timeout elapses.
+                if request_id:
+                    _pending_requests.pop(request_id, None)
+                await websocket.send(json.dumps({
+                    "request_id": request_id,
+                    "status": "error",
+                    "message": "No Figma plugin is currently connected to the bridge.",
+                }))
     except websockets.exceptions.ConnectionClosed:
         logger.info("Controller disconnected: %s", websocket.remote_address)
     finally:
@@ -126,12 +153,41 @@ async def _handle_controller(websocket: ServerConnection) -> None:
             _pending_requests.pop(request_id, None)
 
 
-async def _relay_to_plugins(message: str) -> None:
+async def _fail_all_pending(message: str) -> None:
+    """
+    Send an immediate structured error to every controller with a request
+    currently in _pending_requests, and clear the table. Used when the
+    last connected plugin disconnects (see _handle_plugin's finally block)
+    so in-flight requests fail fast with a clear reason instead of
+    each one silently waiting out its own timeout independently.
+    """
+    if not _pending_requests:
+        return
+    stale = list(_pending_requests.items())
+    _pending_requests.clear()
+    for request_id, (controller_ws, _timestamp) in stale:
+        try:
+            await controller_ws.send(json.dumps({
+                "request_id": request_id,
+                "status": "error",
+                "message": message,
+            }))
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning("Controller connection already closed, couldn't deliver disconnect error for request_id=%s", request_id)
+    logger.info("Failed %d pending request(s) immediately: %s", len(stale), message)
+
+
+async def _relay_to_plugins(message: str) -> bool:
+    """Broadcast `message` to every connected plugin. Returns True if there
+    was at least one plugin to relay to, False if none are connected (so
+    callers can surface a clear, immediate error instead of the controller
+    only finding out via its own response timeout)."""
     if not _plugins:
         logger.warning("No plugin connected — command dropped: %s", message)
-        return
+        return False
     for plugin_ws in list(_plugins):
         await plugin_ws.send(message)
+    return True
 
 
 async def _route_result_to_controller(raw_message: str) -> None:
@@ -180,7 +236,21 @@ async def _process_request(connection: ServerConnection, request):
         return Response(
             200,
             "OK",
-            Headers([("Content-Type", "application/json")]),
+            Headers([
+                ("Content-Type", "application/json"),
+                # Figma's plugin UI iframe fetches this from a different
+                # origin than http://localhost:8765. Without an explicit
+                # CORS allow header, the browser blocks the response from
+                # ever reaching the plugin's JavaScript (even though the
+                # HTTP request itself succeeds with 200, which is why this
+                # failure is invisible in the bridge's own logs) -- the
+                # plugin then never gets a token and never attempts the
+                # WebSocket handshake at all. Safe to allow broadly here:
+                # this endpoint is only ever served on a loopback bind
+                # (see _LOOPBACK_HOSTS above) and returns the same shared
+                # token already sent in the WS handshake itself.
+                ("Access-Control-Allow-Origin", "*"),
+            ]),
             body,
         )
     return None
@@ -219,7 +289,18 @@ async def start_bridge(host: str = "localhost", port: int = 8765) -> None:
     process_request = _process_request if host.lower() in _LOOPBACK_HOSTS else None
     sweep_task = asyncio.create_task(_sweep_pending_requests())
     try:
-        async with websockets.serve(handle_connection, host, port, process_request=process_request):
+        # ping_interval/ping_timeout previously used the websockets
+        # library's own built-in defaults (20s/20s) with no way to tune
+        # them from this project's config -- now explicit and consistent
+        # with bridge_client.py's connect() call, so a dead peer (network
+        # drop without a clean close frame -- e.g. a laptop sleeping) is
+        # detected on a known, configurable cadence on BOTH ends instead
+        # of relying on each side's independent, opaque library default.
+        async with websockets.serve(
+            handle_connection, host, port, process_request=process_request,
+            ping_interval=config.BRIDGE_PING_INTERVAL_SECONDS,
+            ping_timeout=config.BRIDGE_PING_TIMEOUT_SECONDS,
+        ):
             await asyncio.Future()
     finally:
         sweep_task.cancel()

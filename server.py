@@ -4,10 +4,12 @@ Exposes tools for reading Figma files and generating UI via the
 bridge/plugin pipeline, including full natural-language screen generation.
 """
 
+import asyncio
 import logging
 
 from mcp.server.fastmcp import FastMCP
 
+import bridge_client
 import config
 import tools
 from design_plan import DesignPlan
@@ -39,7 +41,7 @@ def echo(message: str, shout: bool = False) -> str:
 
 
 @mcp.tool()
-def get_figma_file_overview(file_id: str = "") -> dict:
+async def get_figma_file_overview(file_id: str = "") -> dict:
     """
     Get a summarized overview of a Figma file: its name and its pages.
 
@@ -48,7 +50,12 @@ def get_figma_file_overview(file_id: str = "") -> dict:
                   configured file from .env.
     """
     logger.info("get_figma_file_overview called with file_id=%r", file_id)
-    return tools.get_file_overview(file_id or None)
+    # tools.get_file_overview performs a blocking httpx.get(); FastMCP calls
+    # sync tool functions directly on the event loop (no automatic thread
+    # offload), so without to_thread this call would stall every other
+    # concurrently-running tool call (including the bridge_client reader
+    # loop) for up to figma_client's 10s request timeout.
+    return await asyncio.to_thread(tools.get_file_overview, file_id or None)
 
 
 @mcp.tool()
@@ -95,9 +102,11 @@ async def generate_ui_from_prompt(prompt: str) -> dict:
     Generate a complete Figma screen from a single natural-language prompt,
     e.g. "a mobile login screen with email, password, and a blue button".
 
-    Uses an LLM planner if ANTHROPIC_API_KEY is configured in .env,
-    otherwise falls back to keyword-matched templates (try 'login' or
-    'dashboard' in the prompt).
+    Uses a local Ollama model (OLLAMA_BASE_URL/OLLAMA_MODEL in .env) as the
+    primary planner; if Ollama is unavailable or its output can't be parsed
+    after retries, falls back automatically to keyword-matched templates
+    (try 'login' or 'dashboard' in the prompt). No external/paid API is
+    required.
     """
     logger.info("generate_ui_from_prompt called: %r", prompt)
     return await tools.generate_from_prompt(prompt)
@@ -106,4 +115,14 @@ async def generate_ui_from_prompt(prompt: str) -> dict:
 if __name__ == "__main__":
     config.validate_config()
     logger.info("Starting Figma MCP Server...")
-    mcp.run()
+    try:
+        mcp.run()
+    finally:
+        # Best-effort graceful shutdown of the persistent bridge connection
+        # (cancels its reader task, fails any still-pending requests, closes
+        # the socket) -- mcp.run() is synchronous/blocking, so this is the
+        # only feasible hook point for cleanup on exit.
+        try:
+            asyncio.run(bridge_client.close())
+        except Exception:
+            logger.warning("Error while closing bridge client connection during shutdown.", exc_info=True)

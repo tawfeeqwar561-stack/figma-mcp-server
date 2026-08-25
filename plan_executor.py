@@ -11,6 +11,7 @@ from typing import Any
 
 import bridge_client
 import config
+import plan_validation
 from design_plan import DesignPlan, DesignNode
 
 logger = logging.getLogger(__name__)
@@ -22,11 +23,21 @@ _POST_HOC_CONTAINERS = {"group", "component_set"}
 
 async def execute_plan(plan: DesignPlan) -> dict[str, Any]:
     """
-    Execute a full DesignPlan: design tokens first, then the element tree.
-    Wrapped in an overall timeout (config.PLAN_EXECUTION_TIMEOUT_SECONDS)
-    so an adversarial/hung plan cannot block a tool call indefinitely --
-    see H-6 in bridge-security-hardening.
+    Execute a full DesignPlan: validate/normalize, design tokens, then the
+    element tree. Wrapped in an overall timeout
+    (config.PLAN_EXECUTION_TIMEOUT_SECONDS) so an adversarial/hung plan
+    cannot block a tool call indefinitely -- see H-6 in
+    bridge-security-hardening.
     """
+    try:
+        plan, validation_notes = plan_validation.validate_and_normalize(plan)
+    except plan_validation.PlanTooLargeError as exc:
+        logger.error("Plan rejected before execution: %s", exc)
+        return {"screen_name": plan.screen_name, "status": "error", "message": str(exc)}
+
+    for note in validation_notes:
+        logger.info("Plan normalization: %s", note)
+
     async def _run() -> dict[str, Any]:
         token_results = await _apply_design_tokens(plan)
 
@@ -36,10 +47,18 @@ async def execute_plan(plan: DesignPlan) -> dict[str, Any]:
         # Deliberately local, not a module global, to avoid leaking allowlist
         # state across concurrent/successive generate_screen calls.
         created_node_ids: set[str] = set()
+        # Per-execution registry of component_node_id keyed by the plan's
+        # logical `register_as` name, so a later `instance` node in the
+        # SAME plan can resolve `component_ref` to a real Figma node id.
+        # Deliberately local for the same reason created_node_ids is.
+        component_registry: dict[str, str] = {}
 
         element_results: list[dict[str, Any]] = []
         for node in plan.elements:
-            element_results.append(await execute_node(node, parent_id=None, created_node_ids=created_node_ids))
+            element_results.append(await execute_node(
+                node, parent_id=None, created_node_ids=created_node_ids,
+                component_registry=component_registry,
+            ))
 
         flat = _flatten(element_results)
         succeeded = sum(1 for r in flat if r.get("status") == "ok")
@@ -51,6 +70,7 @@ async def execute_plan(plan: DesignPlan) -> dict[str, Any]:
             "succeeded": succeeded,
             "failed": len(flat) - succeeded,
             "results": flat,
+            "validation_notes": validation_notes,
         }
 
     try:
@@ -108,7 +128,8 @@ async def _send_command_safe(action: str, payload: dict[str, Any]) -> dict[str, 
 
 
 async def execute_node(
-    node: DesignNode, parent_id: str | None, created_node_ids: set[str]
+    node: DesignNode, parent_id: str | None, created_node_ids: set[str],
+    component_registry: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Execute one node (and recursively, its children), returning its result.
@@ -117,20 +138,47 @@ async def execute_node(
     mistake), they are hoisted up to be siblings under this node's OWN
     parent instead of being attached to this node, which would crash
     the plugin (RectangleNode/TextNode have no appendChild).
+
+    `component_registry` is optional (defaults to a fresh dict) so any
+    existing caller/test invoking execute_node directly without knowledge
+    of component/instance reuse continues to work unchanged.
     """
+    if component_registry is None:
+        component_registry = {}
+
     if node.type in _POST_HOC_CONTAINERS:
-        return await _execute_post_hoc_container(node, parent_id, created_node_ids)
+        return await _execute_post_hoc_container(node, parent_id, created_node_ids, component_registry)
 
     error_message = _validate_parent_id(parent_id, created_node_ids)
     if error_message:
         logger.warning("Rejecting node %r: %s", node.name or node.type, error_message)
         return {"status": "error", "message": error_message, "node_id": None, "_children": []}
 
+    if node.type == "instance":
+        component_node_id = component_registry.get(node.component_ref) if node.component_ref else None
+        if node.component_ref and not component_node_id:
+            # Validation should already have caught a dangling reference and
+            # converted it to a plain frame (see plan_validation.py), but a
+            # hand-built plan calling execute_plan is still defended here.
+            logger.warning("Instance %r references unknown component %r; skipping.", node.name, node.component_ref)
+            return {"status": "error", "message": f"Unknown component_ref: {node.component_ref}", "node_id": None, "_children": []}
+        payload = _build_payload(node, parent_id)
+        payload["component_node_id"] = component_node_id
+        result = await _send_command_safe("create_instance", payload)
+        node_id = result.get("node_id")
+        if result.get("status") == "ok" and node_id:
+            created_node_ids.add(node_id)
+        result["_children"] = []
+        return result
+
     payload = _build_payload(node, parent_id)
     action = _ACTION_MAP[node.type]
 
     result = await _send_command_safe(action, payload)
     node_id = result.get("node_id")
+
+    if node.type == "component" and node.register_as and node_id and result.get("status") == "ok":
+        component_registry[node.register_as] = node_id
 
     _CONTAINER_TYPES = {"frame", "component"}
     child_results = []
@@ -141,7 +189,10 @@ async def execute_node(
         # THIS node's parent instead, to avoid an invalid appendChild call.
         effective_parent = node_id if node.type in _CONTAINER_TYPES else parent_id
         for child in node.children:
-            child_results.append(await execute_node(child, parent_id=effective_parent, created_node_ids=created_node_ids))
+            child_results.append(await execute_node(
+                child, parent_id=effective_parent, created_node_ids=created_node_ids,
+                component_registry=component_registry,
+            ))
     elif result.get("status") == "ok" and node_id:
         created_node_ids.add(node_id)
 
@@ -149,12 +200,16 @@ async def execute_node(
     return result
 
 async def _execute_post_hoc_container(
-    node: DesignNode, parent_id: str | None, created_node_ids: set[str]
+    node: DesignNode, parent_id: str | None, created_node_ids: set[str],
+    component_registry: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Handle 'group' and 'component_set': children must be created FIRST
     (as independent nodes), then combined into the container.
     """
+    if component_registry is None:
+        component_registry = {}
+
     if node.type == "component_set":
         error_message = _validate_parent_id(parent_id, created_node_ids)
         if error_message:
@@ -190,7 +245,7 @@ async def _execute_post_hoc_container(
             logger.warning("Rejecting group %r: %s", node.name or node.type, error_message)
             return {"status": "error", "message": error_message, "node_id": None, "_children": []}
 
-        child_results = [await execute_node(c, parent_id, created_node_ids) for c in node.children]
+        child_results = [await execute_node(c, parent_id, created_node_ids, component_registry) for c in node.children]
         child_ids = [r["node_id"] for r in child_results if r.get("status") == "ok" and r.get("node_id")]
 
         result = await _send_command_safe("create_group", {
@@ -214,6 +269,9 @@ _ACTION_MAP: dict[str, str] = {
     "line": "create_line",
     "image_placeholder": "create_image_placeholder",
     "icon": "create_icon",
+    # "instance" is deliberately NOT in this map -- it's handled by its own
+    # branch in execute_node (needs component_registry lookup first), not
+    # the generic build-payload-then-dispatch path the other types share.
 }
 
 
@@ -225,10 +283,17 @@ def _build_payload(node: DesignNode, parent_id: str | None) -> dict[str, Any]:
         "name": node.name,
         "content": node.content,
         "font_size": node.font_size,
+        "font_weight": node.font_weight,
+        "text_auto_resize": node.text_auto_resize,
         "corner_radius": node.corner_radius,
         "color": node.color.model_dump() if node.color else None,
         "text_color": node.text_color.model_dump() if node.text_color else None,
+        "opacity": node.opacity,
+        "stroke_color": node.stroke_color.model_dump() if node.stroke_color else None,
+        "stroke_weight": node.stroke_weight,
         "auto_layout": node.auto_layout.model_dump() if node.auto_layout else None,
+        "layout_align": node.layout_align,
+        "layout_grow": node.layout_grow,
         "constraints": node.constraints.model_dump() if node.constraints else None,
         "effects": [e.model_dump() for e in node.effects],
         "parent_id": parent_id,

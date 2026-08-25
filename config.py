@@ -28,6 +28,33 @@ BRIDGE_AUTH_TOKEN: str | None = os.getenv("BRIDGE_AUTH_TOKEN")
 # runaway executions -- see H-6 in bridge-security-hardening.
 PLAN_EXECUTION_TIMEOUT_SECONDS: float = float(os.getenv("PLAN_EXECUTION_TIMEOUT_SECONDS", "120"))
 
+# --- Bridge client connection settings (persistent-connection reliability layer) ---
+# Previously hardcoded directly in bridge_client.py; unified here so they can be
+# tuned via .env without touching code, matching the PLAN_EXECUTION_TIMEOUT_SECONDS
+# pattern above. Defaults reproduce the exact prior behavior (10s response wait,
+# ws://localhost:8765).
+BRIDGE_CLIENT_URI: str = os.getenv("BRIDGE_CLIENT_URI", "ws://localhost:8765")
+BRIDGE_RESPONSE_TIMEOUT_SECONDS: float = float(os.getenv("BRIDGE_RESPONSE_TIMEOUT_SECONDS", "10.0"))
+
+# Bounded connect/reconnect retry policy. BRIDGE_CONNECT_MAX_ATTEMPTS caps total
+# attempts per connect cycle (never infinite); the delay between attempts grows
+# exponentially from the base, capped at the max, plus small jitter to avoid
+# thundering-herd reconnects if multiple controllers reconnect at once.
+BRIDGE_CONNECT_MAX_ATTEMPTS: int = int(os.getenv("BRIDGE_CONNECT_MAX_ATTEMPTS", "3"))
+BRIDGE_RECONNECT_BASE_DELAY_SECONDS: float = float(os.getenv("BRIDGE_RECONNECT_BASE_DELAY_SECONDS", "0.5"))
+BRIDGE_RECONNECT_MAX_DELAY_SECONDS: float = float(os.getenv("BRIDGE_RECONNECT_MAX_DELAY_SECONDS", "4.0"))
+
+# WebSocket ping/pong keepalive tuning, used by BOTH bridge.py's
+# websockets.serve(...) and bridge_client.py's websockets.connect(...) so
+# dead-peer detection (e.g. a laptop sleeping, a network drop with no
+# clean close frame) happens on the same known cadence on both ends,
+# instead of each side silently relying on the `websockets` library's own
+# untouched built-in defaults (20s/20s) with no way to tune them here.
+# Values match the library's own defaults, so omitting these env vars
+# reproduces the exact previous behavior.
+BRIDGE_PING_INTERVAL_SECONDS: float = float(os.getenv("BRIDGE_PING_INTERVAL_SECONDS", "20.0"))
+BRIDGE_PING_TIMEOUT_SECONDS: float = float(os.getenv("BRIDGE_PING_TIMEOUT_SECONDS", "20.0"))
+
 _BRIDGE_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bridge_token")
 
 

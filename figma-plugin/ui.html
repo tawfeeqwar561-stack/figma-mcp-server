@@ -6,12 +6,41 @@
 </head>
 <body>
   <div id="status">Connecting...</div>
+  <button id="retryBtn" style="display:none;">Retry connection</button>
 
   <script>
     const statusEl = document.getElementById('status');
+    const retryBtn = document.getElementById('retryBtn');
     let socket;
 
+    // Bounded exponential-backoff reconnect: never loops forever. After
+    // MAX_RECONNECT_ATTEMPTS failed attempts, stop automatically retrying
+    // and surface a manual "Retry connection" button instead of failing
+    // silently or retrying indefinitely.
+    const MAX_RECONNECT_ATTEMPTS = 8;
+    const RECONNECT_BASE_DELAY_MS = 500;
+    const RECONNECT_MAX_DELAY_MS = 30000;
+    let reconnectAttempts = 0;
+
+    function scheduleReconnect() {
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        statusEl.textContent = 'Disconnected from bridge (gave up after ' + MAX_RECONNECT_ATTEMPTS + ' attempts)';
+        retryBtn.style.display = 'inline-block';
+        return;
+      }
+      reconnectAttempts += 1;
+      const backoff = Math.min(RECONNECT_BASE_DELAY_MS * (2 ** (reconnectAttempts - 1)), RECONNECT_MAX_DELAY_MS);
+      const jitter = backoff * Math.random() * 0.2;
+      const delay = backoff + jitter;
+      statusEl.textContent = 'Disconnected from bridge — reconnecting in ' +
+        Math.round(delay / 1000) + 's (attempt ' + reconnectAttempts + '/' + MAX_RECONNECT_ATTEMPTS + ')...';
+      setTimeout(connect, delay);
+    }
+
     async function connect() {
+      // Re-fetch the token on every attempt (not just the first): if the
+      // bridge process restarted since we last connected, its
+      // auto-generated file-based token may have rotated.
       let token = '';
       try {
         const tokenResponse = await fetch('http://localhost:8765/token');
@@ -20,13 +49,18 @@
       } catch (err) {
         statusEl.textContent = 'Failed to fetch bridge token';
         console.error('Could not fetch bridge token:', err);
+        scheduleReconnect();
+        return;
       }
 
       socket = new WebSocket('ws://localhost:8765');
 
       socket.onopen = () => {
+        reconnectAttempts = 0; // reset backoff after a successful connection
+        retryBtn.style.display = 'none';
         statusEl.textContent = 'Connected to bridge';
         socket.send(JSON.stringify({ role: 'plugin', token }));
+        flushPendingResults();
       };
 
       socket.onmessage = (event) => {
@@ -41,18 +75,52 @@
       };
 
       socket.onclose = () => {
-        statusEl.textContent = 'Disconnected from bridge';
+        scheduleReconnect();
       };
     }
 
+    retryBtn.onclick = () => {
+      reconnectAttempts = 0;
+      retryBtn.style.display = 'none';
+      connect();
+    };
+
     connect();
 
-    // Results coming back from code.js get forwarded to the bridge.
+    // Outgoing-result buffer: code.js may finish executing a command (a
+    // real canvas node was created) at a moment the socket happens to be
+    // mid-reconnect, not OPEN. Previously that result was silently
+    // dropped -- the command had genuinely succeeded on the canvas, but
+    // the controller would never learn that, and would just eventually
+    // hit its own response timeout despite the work being done. Buffering
+    // and flushing on the next successful connection closes that gap.
+    // Bounded so a long-disconnected plugin can't grow this without limit.
+    const MAX_BUFFERED_RESULTS = 200;
+    let pendingResults = [];
+
+    function flushPendingResults() {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      while (pendingResults.length > 0) {
+        const result = pendingResults.shift();
+        socket.send(JSON.stringify(result));
+        console.log('UI flushed buffered result to bridge:', result);
+      }
+    }
+
+    // Results coming back from code.js get forwarded to the bridge (or
+    // buffered if the socket isn't open right now).
     window.onmessage = (event) => {
       const result = event.data.pluginMessage;
-      if (result && socket && socket.readyState === WebSocket.OPEN) {
+      if (!result) return;
+      if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify(result));
         console.log('UI sent result to bridge:', result);
+      } else {
+        pendingResults.push(result);
+        if (pendingResults.length > MAX_BUFFERED_RESULTS) {
+          pendingResults.shift(); // drop oldest, never grow unbounded
+        }
+        console.log('Socket not open, buffered result for later delivery:', result);
       }
     };
   </script>
